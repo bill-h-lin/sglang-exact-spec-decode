@@ -1,0 +1,13 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh	2026-09-23 17:43:41.306234313 -0700
++++ b/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh	2026-10-01 01:24:35.675762098 -0700
+@@ -338,6 +338,10 @@
+                     compute_kstep(cur);
+                 }
+ 
++                // Release the stage only after this warp's ldmatrix reads of it are performed: the TMA producer refills it
++                // through the async proxy, so the generic-proxy reads need a proxy fence (every lane) before the arrive
++                cutlass::arch::fence_view_async_shared();
++                __syncwarp();
+                 if (lane_idx == 0)
+                     empty_barriers[stage]->arrive();
+             }

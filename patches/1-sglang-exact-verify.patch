@@ -1,0 +1,574 @@
+diff --git a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
+index 1a59ad0..5393eba 100644
+--- a/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
++++ b/python/sglang/kernels/ops/attention/fla/fused_recurrent.py
+@@ -183,7 +183,7 @@ def fused_recurrent_gated_delta_rule_fwd(
+ 
+ 
+ # Adapted from vllm project.
+-@triton.jit
++@triton.jit(do_not_specialize=["T"])
+ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     mixed_qkv,
+     a,
+@@ -195,12 +195,17 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     ht,
+     ssm_state_indices,
+     scale,
++    inter,
++    inter_indices,
++    T,
+     stride_mixed_qkv_tok: tl.constexpr,
+     stride_a_tok: tl.constexpr,
+     stride_b_tok: tl.constexpr,
+     stride_init_state_token: tl.constexpr,
+     stride_final_state_token: tl.constexpr,
+     stride_indices_seq: tl.constexpr,
++    stride_inter_slot: tl.constexpr,
++    stride_inter_step: tl.constexpr,
+     H: tl.constexpr,
+     HV: tl.constexpr,
+     K: tl.constexpr,
+@@ -209,7 +214,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     BV: tl.constexpr,
+     SOFTPLUS_THRESHOLD: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++    CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
++    STORE_FINAL_STATE: tl.constexpr = True,
+ ):
++    # One program = one (sequence, v-head, V tile), stepping over its T packed
++    # rows (rows i_n * T ... i_n * T + T - 1). Decode is T = 1; linear target
++    # verify runs its draft rows through the same per-step arithmetic, so each
++    # verify row reproduces the decode step at that position bit for bit.
+     i_v, i_nh = tl.program_id(0), tl.program_id(1)
+     i_n, i_hv = i_nh // HV, i_nh % HV
+     i_h = i_hv // (HV // H)
+@@ -221,49 +232,68 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     mask_h = mask_v[:, None] & mask_k[None, :]
+ 
+     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+-    p_o = o + (i_n * HV + i_hv) * V + o_v
+ 
+     if state_idx < 0:
+-        zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
+-        tl.store(p_o, zero, mask=mask_v)
++        zero = tl.zeros([BV], dtype=tl.float32).to(o.dtype.element_ty)
++        for t in range(0, T):
++            tl.store(o + ((i_n * T + t) * HV + i_hv) * V + o_v, zero, mask=mask_v)
+         return
+ 
+     p_h0 = h0 + state_idx * stride_init_state_token
+     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+     b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+ 
+-    p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
+     q_off = i_h * K + o_k
+     k_off = (H * K) + i_h * K + o_k
+     v_off = (2 * H * K) + i_hv * V + o_v
+-    b_q = tl.load(p_mixed + q_off, mask=mask_k, other=0).to(tl.float32)
+-    b_k = tl.load(p_mixed + k_off, mask=mask_k, other=0).to(tl.float32)
+-    b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
++    if CACHE_INTERMEDIATE_STATES:
++        inter_idx = tl.load(inter_indices + i_n).to(tl.int64)
+ 
+-    if USE_QK_L2NORM_IN_KERNEL:
+-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+-    b_q = b_q * scale
++    for t in range(0, T):
++        row = i_n * T + t
++        p_mixed = mixed_qkv + row * stride_mixed_qkv_tok
++        b_q = tl.load(p_mixed + q_off, mask=mask_k, other=0).to(tl.float32)
++        b_k = tl.load(p_mixed + k_off, mask=mask_k, other=0).to(tl.float32)
++        b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
+ 
+-    a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
+-    b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
+-    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+-    x = a_val + dt_bias_val
+-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+-    g_val = -tl.exp(A_log_val) * softplus_x
+-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
++        if USE_QK_L2NORM_IN_KERNEL:
++            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
++            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
++        b_q = b_q * scale
+ 
+-    b_h *= exp(g_val)
+-    b_v -= tl.sum(b_h * b_k[None, :], 1)
+-    b_v *= beta_val
+-    b_h += b_v[:, None] * b_k[None, :]
+-    b_o = tl.sum(b_h * b_q[None, :], 1)
+-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++        a_val = tl.load(a + row * stride_a_tok + i_hv).to(tl.float32)
++        b_val = tl.load(b + row * stride_b_tok + i_hv).to(tl.float32)
++        A_log_val = tl.load(A_log + i_hv).to(tl.float32)
++        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
++        x = a_val + dt_bias_val
++        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
++        g_val = -tl.exp(A_log_val) * softplus_x
++        beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+ 
+-    p_ht = ht + state_idx * stride_final_state_token
+-    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++        b_h *= exp(g_val)
++        b_v -= tl.sum(b_h * b_k[None, :], 1)
++        b_v *= beta_val
++        b_h += b_v[:, None] * b_k[None, :]
++        b_o = tl.sum(b_h * b_q[None, :], 1)
++        p_o = o + (row * HV + i_hv) * V + o_v
++        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++
++        if CACHE_INTERMEDIATE_STATES:
++            if inter_idx >= 0:
++                p_c = (
++                    inter
++                    + inter_idx * stride_inter_slot
++                    + t * stride_inter_step
++                    + i_hv * V * K
++                    + o_v[:, None] * K
++                    + o_k[None, :]
++                )
++                tl.store(p_c, b_h.to(p_c.dtype.element_ty), mask=mask_h)
++
++    if STORE_FINAL_STATE:
++        p_ht = ht + state_idx * stride_final_state_token
++        p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+ 
+ def fused_recurrent_gated_delta_rule_packed_decode(
+@@ -383,12 +413,17 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+         ht=initial_state,
+         ssm_state_indices=ssm_state_indices,
+         scale=scale,
++        inter=initial_state,
++        inter_indices=ssm_state_indices,
++        T=1,
+         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
+         stride_a_tok=stride_a_tok,
+         stride_b_tok=stride_b_tok,
+         stride_init_state_token=stride_init_state_token,
+         stride_final_state_token=stride_final_state_token,
+         stride_indices_seq=stride_indices_seq,
++        stride_inter_slot=0,
++        stride_inter_step=0,
+         H=H,
+         HV=HV,
+         K=K,
+@@ -403,6 +438,87 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+     return out, initial_state
+ 
+ 
++def fused_recurrent_gated_delta_rule_packed_verify(
++    mixed_qkv: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    ssm_state_indices: torch.Tensor,
++    intermediate_states_buffer: torch.Tensor,
++    intermediate_state_indices: torch.Tensor,
++    num_draft_tokens: int,
++    use_qk_l2norm_in_kernel: bool = False,
++) -> torch.Tensor:
++    """Linear-chain target verify on the packed decode kernel.
++
++    mixed_qkv / a / b hold B * T packed rows, request-major (T = num_draft_tokens).
++    Each request's T rows step the decode recurrence in order from
++    ``initial_state[ssm_state_indices[n]]``; the state after step t goes to
++    ``intermediate_states_buffer[intermediate_state_indices[n], t]`` and the
++    initial state is left untouched, as for the recurrent verify kernel.
++    Returns the output as [B * T, HV, V].
++    """
++    T = int(num_draft_tokens)
++    if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
++        raise ValueError("`mixed_qkv` must be 2D and contiguous in the last dim.")
++    if a.stride(-1) != 1 or b.stride(-1) != 1:
++        raise ValueError("`a`/`b` must be contiguous in the last dim.")
++    rows = mixed_qkv.shape[0]
++    if T <= 0 or rows % T != 0:
++        raise ValueError(f"{rows} packed rows are not a multiple of T={T}.")
++    B = rows // T
++    HV, V, K = initial_state.shape[-3:]
++    if tuple(intermediate_states_buffer.shape[-3:]) != (HV, V, K):
++        raise ValueError("Intermediate state buffer does not match the state layout.")
++    qk_dim = mixed_qkv.shape[1] - HV * V
++    H = qk_dim // 2 // K
++    BK = triton.next_power_of_2(K)
++    if triton.cdiv(K, BK) != 1:
++        raise ValueError(f"Packed verify kernel only supports NK=1 (got K={K}).")
++    BV = min(triton.next_power_of_2(V), 32)
++    out = mixed_qkv.new_empty(rows, HV, V)
++    grid = (triton.cdiv(V, BV), B * HV)
++    fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
++        mixed_qkv=mixed_qkv,
++        a=a,
++        b=b,
++        A_log=A_log,
++        dt_bias=dt_bias,
++        o=out,
++        h0=initial_state,
++        ht=initial_state,
++        ssm_state_indices=ssm_state_indices,
++        scale=scale,
++        inter=intermediate_states_buffer,
++        inter_indices=intermediate_state_indices,
++        T=T,
++        stride_mixed_qkv_tok=mixed_qkv.stride(0),
++        stride_a_tok=a.stride(0),
++        stride_b_tok=b.stride(0),
++        stride_init_state_token=initial_state.stride(0),
++        stride_final_state_token=initial_state.stride(0),
++        stride_indices_seq=ssm_state_indices.stride(0),
++        stride_inter_slot=intermediate_states_buffer.stride(0),
++        stride_inter_step=intermediate_states_buffer.stride(1),
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        SOFTPLUS_THRESHOLD=20.0,
++        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        CACHE_INTERMEDIATE_STATES=True,
++        STORE_FINAL_STATE=False,
++        num_warps=1,
++        num_stages=3,
++    )
++    return out
++
++
+ @triton.jit
+ def fused_recurrent_kda_packed_decode_kernel(
+     mixed_qkv,
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index 15ac8ab..b073f7c 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -4,6 +4,9 @@ import msgspec
+ import torch
+ 
+ from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
++from sglang.kernels.ops.attention.fla.fused_recurrent import (
++    fused_recurrent_gated_delta_rule_packed_verify,
++)
+ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+     causal_conv1d_fn,
+     causal_conv1d_update,
+@@ -543,6 +546,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             )
+         )
+         self._use_strided_target_verify_qkv = False
++        # Linear-chain target verify on the packed decode kernel: each verify
++        # row then steps the same recurrence as decode, bit for bit. Only when
++        # decode itself is the Triton packed decode.
++        self.use_packed_target_verify = (
++            isinstance(self.kernel_dispatcher.decode_kernel, TritonGDNKernel)
++            and self.kernel_dispatcher.supports_packed_decode
++            and (
++                envs.SGLANG_GDN_PACKED_TARGET_VERIFY.get()
++                or get_exec().deterministic.enable_deterministic_inference
++            )
++        )
++        if self.use_packed_target_verify:
++            rank0_log("GDN linear target verify uses the packed decode kernel.")
+ 
+     def init_forward_metadata_out_graph(
+         self,
+@@ -1013,6 +1029,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             ).transpose(0, 1)[:seq_len]
+ 
+         actual_seq_len = mixed_qkv.shape[0]
++        if (
++            is_target_verify
++            and self.use_packed_target_verify
++            and retrieve_parent_token is None
++            and not use_replayssm_fold
++            and not use_replayssm_spec
++        ):
++            core_attn_out = fused_recurrent_gated_delta_rule_packed_verify(
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++                A_log=layer.A_log,
++                dt_bias=layer.dt_bias,
++                scale=layer.head_k_dim**-0.5,
++                initial_state=ssm_states,
++                ssm_state_indices=cache_indices[:batch_size],
++                intermediate_states_buffer=intermediate_state_cache,
++                intermediate_state_indices=intermediate_state_indices[:batch_size],
++                num_draft_tokens=draft_token_num,
++                use_qk_l2norm_in_kernel=True,
++            )
++            return core_attn_out.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+         if (
+             (is_cuda() or is_hip() or is_xpu())
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 914def7..b9cb332 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+ from sglang.srt.environ import envs
++from sglang.srt.utils.common import rank0_log
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+ from sglang.srt.layers.dcp import (
+@@ -373,6 +374,39 @@ class TritonAttnBackend(AttentionBackend):
+         else:
+             self.kv_indptr = kv_indptr_buf
+ 
++        # Deterministic linear-chain target verify (DFLASH / DSpark, topk <= 1)
++        # runs its 1 + k causal rows as independent decode rows with KV lengths
++        # prefix + 1 ... prefix + k + 1, so every verify row matches decode
++        # bit for bit (same kernel, same fixed split tiles).
++        self.enable_target_verify_decode = (
++            _is_cuda
++            and self.enable_deterministic
++            and model_runner.spec_algorithm.is_dflash_family()
++            and not model_runner.is_draft_worker
++            and self.topk <= 1
++            and not self.use_mla
++            and self.dcp_size == 1
++            and not (
++                self.sliding_window_size is not None and self.sliding_window_size > 0
++            )
++            and not self.kv_index_translator.is_translating
++            and not model_runner.model_config.is_encoder_decoder
++        )
++        if self.enable_target_verify_decode:
++            self.target_verify_kv_indptr = torch.zeros(
++                (
++                    max_bs
++                    * max(
++                        self.num_draft_tokens or 1,
++                        self.target_verify_num_tokens_per_req or 1,
++                    )
++                    + 1,
++                ),
++                dtype=torch.int32,
++                device=model_runner.device,
++            )
++            rank0_log("Triton linear target verify runs as decode rows.")
++
+         # Sliding window may need a second buffer for interleaved attention types
+         self.window_kv_indptr = None
+         if self.sliding_window_size is not None and self.sliding_window_size > 0:
+@@ -498,8 +532,9 @@ class TritonAttnBackend(AttentionBackend):
+         seq_lens: torch.Tensor,
+         req_pool_indices: torch.Tensor,
+         kv_indices: torch.Tensor,
++        kv_indptr: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+-        kv_indptr = self.kv_indptr[: bs + 1]
++        kv_indptr = (self.kv_indptr if kv_indptr is None else kv_indptr)[: bs + 1]
+         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+         self.kv_index_translator.fill_packed_read_stream(
+             req_pool_indices=req_pool_indices[:bs],
+@@ -510,6 +545,42 @@ class TritonAttnBackend(AttentionBackend):
+         )
+         return kv_indptr
+ 
++    def _target_verify_uses_decode(self, spec_info: Optional[SpecInput]) -> bool:
++        return (
++            self.enable_target_verify_decode
++            and spec_info is not None
++            and getattr(spec_info, "custom_mask", None) is None
++            and getattr(spec_info, "ragged_verify_layout", None) is None
++            and getattr(spec_info, "topk", 1) in (None, 0, 1)
++        )
++
++    def _build_target_verify_decode_kv(
++        self,
++        prefix_lens: torch.Tensor,
++        req_pool_indices: torch.Tensor,
++        num_tokens_per_req: int,
++        kv_indices: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Decode-row KV metadata for a linear verify block: row j of a request
++        attends its first prefix_len + j + 1 tokens, as decode at that position."""
++        seq_lens = (
++            prefix_lens[:, None]
++            + torch.arange(
++                1,
++                num_tokens_per_req + 1,
++                dtype=prefix_lens.dtype,
++                device=prefix_lens.device,
++            )
++        ).reshape(-1)
++        kv_indptr = self._fill_kv_indptr_and_indices(
++            seq_lens.shape[0],
++            seq_lens,
++            req_pool_indices.repeat_interleave(num_tokens_per_req),
++            kv_indices,
++            self.target_verify_kv_indptr,
++        )
++        return kv_indptr, seq_lens
++
+     def _update_decode_kv_buffers(
+         self,
+         bs: int,
+@@ -821,9 +892,34 @@ class TritonAttnBackend(AttentionBackend):
+         # Lean decode buffers are only allocated on the decode path below; default
+         # to None so the shared ForwardMetadata constructor works for extend/verify.
+         lean_Mp = lean_Lp = lean_Op = lean_locks = None
+-
+-        if forward_batch.forward_mode.is_decode_or_idle():
+-            if spec_info is None or spec_info.kv_indptr is None:
++        target_verify_as_decode = (
++            forward_batch.forward_mode.is_target_verify()
++            and self._target_verify_uses_decode(spec_info)
++        )
++        decode_seq_lens = forward_batch.seq_lens
++
++        if forward_batch.forward_mode.is_decode_or_idle() or target_verify_as_decode:
++            if target_verify_as_decode:
++                bs = len(forward_batch.req_pool_indices)
++                num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
++                seq_lens_sum = forward_batch.seq_lens_sum
++                kv_indices_len = (
++                    bs * num_tokens_per_req * self.max_context_len
++                    if seq_lens_sum is None
++                    else num_tokens_per_req * seq_lens_sum
++                    + bs * num_tokens_per_req * (num_tokens_per_req + 1) // 2
++                )
++                kv_indices = torch.empty(
++                    kv_indices_len, dtype=torch.int64, device=self.device
++                )
++                kv_indptr, decode_seq_lens = self._build_target_verify_decode_kv(
++                    forward_batch.seq_lens[:bs],
++                    forward_batch.req_pool_indices[:bs],
++                    num_tokens_per_req,
++                    kv_indices,
++                )
++                bs *= num_tokens_per_req
++            elif spec_info is None or spec_info.kv_indptr is None:
+                 # kv_indptr is None for draft-extend's idle batch; build from seq_lens.
+                 if self.dcp_size > 1:
+                     # DCP: per-rank sharded KV indices, else each rank reads the
+@@ -895,7 +991,7 @@ class TritonAttnBackend(AttentionBackend):
+                 (
+                     self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
+                     if self.dcp_size > 1
+-                    else forward_batch.seq_lens
++                    else decode_seq_lens
+                 ),
+             )
+ 
+@@ -1206,13 +1302,22 @@ class TritonAttnBackend(AttentionBackend):
+         pre-allocated SWA write-target buffer view (or None for non-SWA).
+         """
+         swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+-        if forward_mode.is_decode_or_idle():
++        target_verify_as_decode = (
++            forward_mode.is_target_verify()
++            and self._target_verify_uses_decode(spec_info)
++        )
++        if forward_mode.is_decode_or_idle() or target_verify_as_decode:
++            if target_verify_as_decode:
++                bs *= self._target_verify_num_tokens_per_req(spec_info)
++                kv_indptr = self.target_verify_kv_indptr[: bs + 1]
++            else:
++                kv_indptr = self.kv_indptr[: bs + 1]
+             return ForwardMetadata(
+                 attn_logits=self.cuda_graph_attn_logits,
+                 attn_lse=self.cuda_graph_attn_lse,
+                 max_extend_len=None,
+                 num_kv_splits=self.cuda_graph_num_kv_splits,
+-                kv_indptr=self.kv_indptr[: bs + 1],
++                kv_indptr=kv_indptr,
+                 kv_indices=self.cuda_graph_kv_indices,
+                 qo_indptr=None,
+                 custom_mask=None,
+@@ -1333,9 +1438,22 @@ class TritonAttnBackend(AttentionBackend):
+                 )
+         elif forward_mode.is_target_verify():
+             bs = len(req_pool_indices)
+-            self._update_target_verify_buffers(
+-                bs, seq_lens, spec_info, req_pool_indices
+-            )
++            if self._target_verify_uses_decode(spec_info):
++                num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
++                _, decode_seq_lens = self._build_target_verify_decode_kv(
++                    seq_lens[:bs],
++                    req_pool_indices[:bs],
++                    num_tokens_per_req,
++                    self.cuda_graph_kv_indices,
++                )
++                self.get_num_kv_splits(
++                    self.cuda_graph_num_kv_splits[: decode_seq_lens.shape[0]],
++                    decode_seq_lens,
++                )
++            else:
++                self._update_target_verify_buffers(
++                    bs, seq_lens, spec_info, req_pool_indices
++                )
+         elif forward_mode.is_dllm_extend():
+             self._update_dllm_buffers(bs, seq_lens, req_pool_indices)
+         elif forward_mode.is_draft_extend_v2():
+@@ -1701,6 +1819,26 @@ class TritonAttnBackend(AttentionBackend):
+                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
+             )
+ 
++        if forward_batch.forward_mode.is_target_verify() and (
++            self._target_verify_uses_decode(forward_batch.spec_info)
++        ):
++            if not causal:
++                raise RuntimeError(
++                    "Triton target-verify decode metadata requires causal attention"
++                )
++            return self.forward_decode(
++                q,
++                k,
++                v,
++                layer,
++                forward_batch,
++                save_kv_cache=False,
++                sinks=sinks,
++                score_mod=score_mod,
++                aux_tensors=aux_tensors,
++                output=o,
++            )
++
+         # Deterministic mode: use unified 1-stage kernel
+         if self.enable_deterministic:
+             return self._forward_extend_unified(
+@@ -2181,13 +2319,16 @@ class TritonAttnBackend(AttentionBackend):
+         sinks=None,
+         score_mod=None,
+         aux_tensors=None,
++        output=None,
+     ):
+         # During torch.compile, there is a bug in rotary_emb that causes the
+         # output value to have a 3D tensor shape. This reshapes the output correctly.
+         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+ 
+         # TODO: reuse the buffer across layers
+-        if layer.qk_head_dim != layer.v_head_dim:
++        if output is not None:
++            o = output
++        elif layer.qk_head_dim != layer.v_head_dim:
+             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+         else:
+             o = torch.empty_like(q)
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 1012624..ad20a52 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1761,6 +1782,9 @@ class Envs:
+ 
+     # Qwen3.5 and GDN
+     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
++    # Linear target verify through the Triton packed-decode kernel, so each
++    # verify row matches decode bit for bit (always on with deterministic inference).
++    SGLANG_GDN_PACKED_TARGET_VERIFY = EnvBool(False)
+     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
+     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
+     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
