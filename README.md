@@ -81,8 +81,8 @@ See [`patches/`](patches/). Base: SGLang `main` at `542a043` (2026-09-23), DeepG
    I measured): sgl-project/sglang#42145.
 3. `3-deepgemm-sm120-fence.patch` -- the pipeline fence. Upstream fix (the fence alone) is
    [sgl-project/DeepGEMM#93](https://github.com/sgl-project/DeepGEMM/pull/93) by Ting SUN, merged into
-   `dev` 2026-10-03, not in a release yet. This file also adds `__syncwarp()`, and that is what I
-   measured.
+   `dev` 2026-10-03; 0.2.2 and 0.2.3rc0 still ship the unfenced header, so keep this patch. This file
+   also adds `__syncwarp()`, and that is what I measured.
 
 ### Apply
 
@@ -95,9 +95,9 @@ SP=$(python -c 'import deep_gemm, os; print(os.path.dirname(os.path.dirname(deep
 patch -p1 -d "$SP" < 3-deepgemm-sm120-fence.patch
 ```
 
-A pip reinstall of `sgl-deep-gemm` drops patch 3. DeepGEMM compiles kernels at run time, so point
-`SGLANG_DG_CACHE_DIR` at an empty directory the first time, or the old kernel can come back from the
-cache.
+A pip reinstall or upgrade of `sgl-deep-gemm` drops patch 3. DeepGEMM compiles kernels at run time, so
+point `SGLANG_DG_CACHE_DIR` at an empty directory the first time, or the old kernel can come back from
+the cache.
 
 ### Launch
 
