@@ -5,7 +5,7 @@ produces the same output when I haven't changed anything. If the engine drifts o
 tell that apart from the effect I'm trying to measure.
 
 This repo is the evidence and the fix for one case of that drift: speculative decoding on a hybrid
-GDN model, where "lossless" was being claimed without anyone checking the token ids.
+GDN model, where "lossless" is usually claimed without checking the token ids.
 
 Measured on one RTX PRO 6000 Blackwell Max-Q (SM120), Qwen3.8-27B, BF16 weights and BF16 KV,
 temperature 0, one request at a time unless noted.
@@ -25,9 +25,9 @@ First, a control that surprised me. Before any of my patches, on vLLM nightly (D
 - a different attention backend: 20 of 24 differ
 
 So a capacity setting moved more outputs than speculation did. The divergences all sat where the
-top-1 and top-2 logits were within about 0.125 of each other, which is where rounding order decides
-the token. I recorded the `--max-num-seqs` mechanism as unexplained rather than asserting a cause,
-because I have not isolated it.
+top-1 and top-2 logits were within 0.25 of each other (0.125 for the backend and `--max-num-seqs`
+changes), which is where rounding order decides the token. I recorded the `--max-num-seqs`
+mechanism as unexplained rather than asserting a cause, because I have not isolated it.
 
 On SGLang, turning on deterministic mode alone was not enough. With speculation on, 19 of 24 prompts
 still gave different token ids and all 24 had different logprobs from no-speculation. Two changes to
@@ -87,12 +87,13 @@ See [`patches/`](patches/). Base: SGLang `main` at `542a043` (2026-09-23), DeepG
 ### Apply
 
 ```
+P=/path/to/sglang-exact-spec-decode/patches
 cd sglang && git checkout 542a043
-git apply 1-sglang-exact-verify.patch 2-sglang-small-m-route.patch
+git apply "$P/1-sglang-exact-verify.patch" "$P/2-sglang-small-m-route.patch"
 pip install -e "python"
 
 SP=$(python -c 'import deep_gemm, os; print(os.path.dirname(os.path.dirname(deep_gemm.__file__)))')
-patch -p1 -d "$SP" < 3-deepgemm-sm120-fence.patch
+patch -p1 -d "$SP" < "$P/3-deepgemm-sm120-fence.patch"
 ```
 
 A pip reinstall or upgrade of `sgl-deep-gemm` drops patch 3. DeepGEMM compiles kernels at run time, so
@@ -120,4 +121,4 @@ https://www.reddit.com/r/LocalLLaMA/comments/1x3sx3d/
 
 ## License
 
-Apache-2.0, matching SGLang. The patches are derivative of SGLang (Apache-2.0) and DeepGEMM.
+Apache-2.0, matching SGLang. The patches are derivative of SGLang (Apache-2.0) and DeepGEMM (MIT).
