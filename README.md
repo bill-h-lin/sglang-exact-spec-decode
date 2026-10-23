@@ -81,8 +81,9 @@ See [`patches/`](patches/). Base: SGLang `main` at `542a043` (2026-09-23), DeepG
    I measured): sgl-project/sglang#42145.
 3. `3-deepgemm-sm120-fence.patch` -- the pipeline fence. Upstream fix (the fence alone) is
    [sgl-project/DeepGEMM#93](https://github.com/sgl-project/DeepGEMM/pull/93) by Ting SUN, merged into
-   `dev` 2026-10-03; 0.2.2 and 0.2.3rc0 still ship the unfenced header, so keep this patch. This file
-   also adds `__syncwarp()`, and that is what I measured.
+   `dev` 2026-10-03; released in 0.2.3 (2026-10-16), which SGLang `main` has pinned since 2026-10-18.
+   On the recipe's base (DeepGEMM 0.2.0) keep this patch; on 0.2.3 or later skip it: it won't apply.
+   This file also adds `__syncwarp()`, and that is what I measured.
 
 ### Apply
 
